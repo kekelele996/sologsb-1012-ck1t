@@ -13,10 +13,37 @@ import {
   type Difficulty,
   type GestureZone,
   type LessonStep,
+  type ProjectSnapshot,
+  type ReviewAnnotation,
+  type ReviewDecision,
+  type ReviewRound,
   type ValidationCheck,
 } from '../../models';
+import {
+  SAMPLE_ANNOTATIONS,
+  annotationFingerprint,
+  applyAcceptedAnnotations,
+  baseSnapshot,
+  evaluateAnnotation,
+  fieldLabel,
+  fieldOptions,
+  loadRounds,
+  parseAnnotations,
+  revalidateCandidate,
+  roundStats,
+  saveRounds,
+  viewTarget,
+  type TargetView,
+} from '../../review';
 
 type PreviewSize = 'phone' | 'tablet';
+type ActivePanel = 'editor' | 'checks' | 'review';
+type AlertState = {
+  title: string;
+  message: string;
+  confirmText: string;
+  onConfirm: () => void;
+};
 
 @Component({
   tag: 'app-root',
@@ -26,11 +53,15 @@ type PreviewSize = 'phone' | 'tablet';
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
-  @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() activePanel: ActivePanel = 'editor';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  @State() rounds: ReviewRound[] = [];
+  @State() importText = '';
+  @State() newRoundVersionId = '';
+  @State() alertState?: AlertState;
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
@@ -42,6 +73,9 @@ export class AppRoot {
     } catch {
       this.project = createDemoProject();
     }
+    this.rounds = loadRounds();
+    const openRound = this.rounds.find((round) => round.status === 'open');
+    this.newRoundVersionId = openRound?.baseVersionId ?? this.project.frozenVersions[0]?.id ?? '';
   }
 
   disconnectedCallback(): void {
@@ -95,6 +129,252 @@ export class AppRoot {
 
   private get checks(): ValidationCheck[] {
     return validateProject(this.project);
+  }
+
+  private get openRound(): ReviewRound | undefined {
+    return this.rounds.find((round) => round.status === 'open');
+  }
+
+  private persistRounds(): void {
+    saveRounds(this.rounds);
+    this.rounds = [...this.rounds];
+  }
+
+  private updateRound(roundId: string, update: (round: ReviewRound) => ReviewRound): void {
+    this.rounds = this.rounds.map((round) => (round.id === roundId ? update(structuredClone(round)) : round));
+    saveRounds(this.rounds);
+  }
+
+  private createRound(): void {
+    if (this.openRound) {
+      this.showToast('warning', '已有进行中的审阅回合，请先完成或放弃。');
+      return;
+    }
+    const base = this.project.frozenVersions.find((version) => version.id === this.newRoundVersionId) ?? this.project.frozenVersions[0];
+    if (!base) {
+      this.showToast('danger', '还没有冻结版本，请先冻结一个版本再发起审阅。');
+      return;
+    }
+    const round: ReviewRound = {
+      id: `round-${Date.now().toString(36)}`,
+      title: `审阅回合 · ${base.label}`,
+      createdAt: new Date().toISOString(),
+      baseVersionId: base.id,
+      annotations: [],
+      status: 'open',
+    };
+    this.rounds = [round, ...this.rounds];
+    this.importText = '';
+    this.persistRounds();
+    this.showToast('success', `已基于“${base.label}”开启审阅回合，可粘贴离线批注。`);
+  }
+
+  private discardRound(roundId: string): void {
+    const round = this.rounds.find((item) => item.id === roundId);
+    if (!round) return;
+    this.alertState = {
+      title: '放弃审阅回合？',
+      message: `“${round.title}”及其 ${round.annotations.length} 条批注处理记录将被删除，冻结版本不受影响。`,
+      confirmText: '放弃回合',
+      onConfirm: () => {
+        this.rounds = this.rounds.filter((item) => item.id !== roundId);
+        this.persistRounds();
+        this.alertState = undefined;
+        this.showToast('medium', '审阅回合已放弃。');
+      },
+    };
+  }
+
+  private importAnnotations(): void {
+    const round = this.openRound;
+    if (!round) return;
+    const parsed = parseAnnotations(this.importText);
+    if (!parsed.annotations.length) {
+      this.showToast('danger', parsed.errors.length ? `未导入任何批注：${parsed.errors[0]}` : '没有识别到批注内容。');
+      return;
+    }
+
+    const seen = new Set<string>();
+    this.rounds.forEach((item) => item.annotations.forEach((annotation) => seen.add(annotation.fingerprint)));
+    const nextOrdinal = round.annotations.length;
+    const imported: ReviewAnnotation[] = [];
+    let duplicates = 0;
+
+    for (const item of parsed.annotations) {
+      const fingerprint = annotationFingerprint(item);
+      if (seen.has(fingerprint)) {
+        duplicates += 1;
+        continue;
+      }
+      seen.add(fingerprint);
+      const evaluated = evaluateAnnotation(item, round, this.project.frozenVersions);
+      imported.push({
+        id: `note-${Date.now().toString(36)}-${imported.length}`,
+        ordinal: nextOrdinal + imported.length + 1,
+        targetType: item.targetType,
+        targetId: evaluated.targetId,
+        moduleId: evaluated.moduleId,
+        stepOrdinal: item.stepOrdinal,
+        targetHint: item.targetHint,
+        basedOnLabel: item.basedOnLabel,
+        field: item.field,
+        suggestedValue: item.suggestedValue,
+        originalValue: item.originalValue,
+        comment: item.comment,
+        candidateValue: evaluated.candidateValue,
+        decision: 'pending',
+        conflicts: evaluated.conflicts,
+        fingerprint,
+        importedAt: new Date().toISOString(),
+      });
+    }
+
+    if (imported.length === 0) {
+      this.showToast('warning', `识别到 ${parsed.annotations.length} 条，但全部为已导入过的重复意见，未重复处理。`);
+      return;
+    }
+
+    this.updateRound(round.id, (draft) => ({ ...draft, annotations: [...draft.annotations, ...imported] }));
+    this.importText = '';
+    const conflictCount = imported.filter((item) => item.conflicts.length > 0).length;
+    const details = [`新增 ${imported.length} 条批注`];
+    if (duplicates) details.push(`跳过重复 ${duplicates} 条`);
+    if (conflictCount) details.push(`${conflictCount} 条存在冲突待核实`);
+    if (parsed.errors.length) details.push(`${parsed.errors.length} 行未识别`);
+    this.showToast(conflictCount ? 'warning' : 'success', `${details.join('，')}。`);
+  }
+
+  private setDecision(roundId: string, annotationId: string, decision: ReviewDecision): void {
+    this.updateRound(roundId, (round) => ({
+      ...round,
+      annotations: round.annotations.map((annotation) => {
+        if (annotation.id !== annotationId) return annotation;
+        const resetConflict = decision !== 'accepted' ? false : annotation.conflictAcknowledged;
+        return { ...annotation, decision, decidedAt: new Date().toISOString(), conflictAcknowledged: resetConflict };
+      }),
+    }));
+  }
+
+  private acknowledgeConflict(roundId: string, annotationId: string): void {
+    this.updateRound(roundId, (round) => ({
+      ...round,
+      annotations: round.annotations.map((annotation) => annotation.id === annotationId ? { ...annotation, conflictAcknowledged: true } : annotation),
+    }));
+  }
+
+  private editCandidate(roundId: string, annotationId: string, value: string): void {
+    this.updateRound(roundId, (round) => ({
+      ...round,
+      annotations: round.annotations.map((annotation) => {
+        if (annotation.id !== annotationId) return annotation;
+        const updated = { ...annotation, candidateValue: value, conflictAcknowledged: false };
+        updated.conflicts = revalidateCandidate(updated, this.project.frozenVersions, round.baseVersionId);
+        return updated;
+      }),
+    }));
+  }
+
+  private locateAnnotation(annotation: ReviewAnnotation): void {
+    const round = this.rounds.find((item) => item.annotations.some((note) => note.id === annotation.id));
+    const snapshot = round ? baseSnapshot(this.project.frozenVersions, round.baseVersionId) : undefined;
+    if (!round || !snapshot) return;
+    const view: TargetView = viewTarget({
+      targetType: annotation.targetType,
+      targetId: annotation.targetId,
+      moduleId: annotation.moduleId,
+      stepOrdinal: annotation.stepOrdinal,
+      targetHint: annotation.targetHint,
+    }, snapshot);
+    if (!view.module) {
+      this.showToast('warning', '基准冻结版本中找不到该对象，无法定位。');
+      return;
+    }
+    // 在当前课程中按冻结快照的标题/id 定位；确认前当前内容可能与冻结版不同
+    const sourceTitle = view.module.title;
+    const currentModule = this.project.modules.find((item) => item.title === sourceTitle) ?? this.project.modules.find((item) => item.id === view.module!.id);
+    if (!currentModule) {
+      this.showToast('warning', `“${sourceTitle}”在当前课程中已找不到，可在审阅回合中查看冻结版本记录。`);
+      return;
+    }
+    const step = view.step ? currentModule.steps.find((item) => item.title === view.step!.title) ?? currentModule.steps.find((item) => item.id === view.step!.id) : undefined;
+    this.selectModule(currentModule.id);
+    if (step) this.selectStep(step.id);
+    this.activePanel = 'editor';
+    this.showToast('medium', `批注来自冻结版本“${this.versionLabel(round.baseVersionId)}”，此处为当前课程内容。`);
+  }
+
+  private versionLabel(versionId: string): string {
+    return this.project.frozenVersions.find((version) => version.id === versionId)?.label ?? '未知冻结版本';
+  }
+
+  private roundBlockingReason(round: ReviewRound): string | undefined {
+    const stats = roundStats(round);
+    if (stats.total === 0) return '还没有导入任何批注。';
+    if (stats.pending > 0) return `还有 ${stats.pending} 条意见未选择采纳或保留。`;
+    const unresolved = round.annotations.filter((item) => item.decision === 'accepted' && item.conflicts.length > 0 && !item.conflictAcknowledged);
+    if (unresolved.length) return `${unresolved.length} 条采纳意见仍有未核实的冲突。`;
+    const base = this.project.frozenVersions.find((version) => version.id === round.baseVersionId);
+    if (!base) return '基准冻结版本已不存在，无法生成修订版。';
+    return undefined;
+  }
+
+  private confirmRound(roundId: string): void {
+    const round = this.rounds.find((item) => item.id === roundId);
+    if (!round) return;
+    const reason = this.roundBlockingReason(round);
+    if (reason) {
+      this.showToast('danger', reason);
+      return;
+    }
+    const snapshot = baseSnapshot(this.project.frozenVersions, round.baseVersionId)!;
+    const accepted = round.annotations.filter((item) => item.decision === 'accepted');
+    const kept = round.annotations.filter((item) => item.decision === 'kept');
+    this.alertState = {
+      title: '确认生成新修订版？',
+      message: `将从冻结版本“${this.versionLabel(round.baseVersionId)}”复制内容，套用 ${accepted.length} 条采纳修改，${kept.length} 条保留意见仅留档。旧冻结版本与本回合处理记录都会保留。`,
+      confirmText: '生成修订版',
+      onConfirm: () => this.executeRound(roundId, snapshot, accepted.map((item) => item.id)),
+    };
+  }
+
+  private executeRound(roundId: string, snapshot: ProjectSnapshot, acceptedIds: string[]): void {
+    const round = this.rounds.find((item) => item.id === roundId);
+    this.alertState = undefined;
+    if (!round) return;
+    const acceptedSet = new Set(acceptedIds);
+    const preparedAnnotations = round.annotations.map((annotation) => acceptedSet.has(annotation.id) ? { ...annotation, applied: false } : annotation);
+    const result = applyAcceptedAnnotations(snapshot, preparedAnnotations);
+    const appliedSet = new Set(result.appliedIds);
+    const newRevision = Math.max(this.project.revision, ...this.project.frozenVersions.map((version) => version.snapshot.revision), snapshot.revision) + 1;
+    const before = cloneProject(this.project);
+    const next: CourseProject = {
+      ...this.project,
+      ...result.snapshot,
+      frozenVersions: this.project.frozenVersions,
+      status: 'changes',
+      revision: newRevision,
+      lastSavedAt: new Date().toISOString(),
+    };
+    this.past = [...this.past, before].slice(-80);
+    this.future = [];
+    this.project = next;
+    this.persist();
+    this.updateRound(roundId, (draft) => ({
+      ...draft,
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      resultLabel: `修订版 v${newRevision}`,
+      resultRevision: newRevision,
+      annotations: draft.annotations.map((annotation) => appliedSet.has(annotation.id) ? { ...annotation, applied: true } : annotation),
+    }));
+    this.activePanel = 'editor';
+    const commentOnly = round.annotations.filter((note) => acceptedSet.has(note.id) && !note.field).length;
+    const missing = acceptedIds.length - result.appliedIds.length - commentOnly;
+    const notes: string[] = [];
+    if (commentOnly) notes.push(`${commentOnly} 条纯意见仅留档`);
+    if (missing > 0) notes.push(`${missing} 条因基准版本中对象缺失未写入`);
+    const tail = notes.length ? `（${notes.join('，')}）` : '';
+    this.showToast('success', `已从冻结版本生成修订版 v${newRevision}，字段类采纳意见全部写入，可继续编辑后重新提交。${tail}`);
   }
 
   private persist(): void {
@@ -299,6 +579,7 @@ export class AppRoot {
         createdAt: new Date().toISOString(),
         snapshot,
       };
+      this.newRoundVersionId = version.id;
       return { ...draft, status: 'frozen', frozenVersions: [version, ...frozenVersions] };
     }, '当前课程版本已冻结。');
     this.playing = false;
@@ -389,6 +670,16 @@ export class AppRoot {
           <div class="frozen-callout">
             <div><strong>此版本已冻结</strong><span>字段已锁定，仍可预览和运行检查。</span></div>
             <ion-button size="small" class="studio-button" onClick={() => this.reviseFrozen()}>创建修订版</ion-button>
+          </div>
+        )}
+
+        {this.openRound && (
+          <div class="review-callout">
+            <div>
+              <strong>审阅回合进行中 · {this.versionLabel(this.openRound.baseVersionId)}</strong>
+              <span>批注处理在“审阅回合”页完成；此处直接修改不会记入该回合，确认回合时会以冻结版本为准生成修订版。</span>
+            </div>
+            <ion-button size="small" fill="outline" class="studio-button" onClick={() => { this.activePanel = 'review'; }}>回到审阅回合</ion-button>
           </div>
         )}
 
@@ -511,6 +802,268 @@ export class AppRoot {
     );
   }
 
+  private annotationView(annotation: ReviewAnnotation): TargetView | undefined {
+    const round = this.openRound ?? this.rounds.find((item) => item.annotations.some((note) => note.id === annotation.id));
+    const snapshot = round ? baseSnapshot(this.project.frozenVersions, round.baseVersionId) : undefined;
+    if (!snapshot) return undefined;
+    return viewTarget({
+      targetType: annotation.targetType,
+      targetId: annotation.targetId,
+      moduleId: annotation.moduleId,
+      stepOrdinal: annotation.stepOrdinal,
+      targetHint: annotation.targetHint,
+    }, snapshot);
+  }
+
+  private renderConflictList(annotation: ReviewAnnotation) {
+    if (!annotation.conflicts.length) return null;
+    return (
+      <div class="annotation-conflicts">
+        {annotation.conflicts.map((conflict) => (
+          <div class={`annotation-conflict ${conflict.type}`}>
+            <strong>{this.conflictLabel(conflict.type)}</strong>
+            <span>{conflict.message}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  private conflictLabel(type: ReviewAnnotation['conflicts'][number]['type']): string {
+    switch (type) {
+      case 'target-missing': return '原对象不存在';
+      case 'step-moved': return '步骤已移动';
+      case 'version-stale': return '基于旧版本';
+      case 'value-drift': return '内容已变化';
+      case 'invalid-value': return '建议值非法';
+    }
+  }
+
+  private renderCandidateEditor(round: ReviewRound, annotation: ReviewAnnotation) {
+    if (annotation.field && annotation.suggestedValue === undefined && !annotation.comment) return null;
+    const options = fieldOptions(annotation.field);
+    const disabled = round.status === 'completed';
+    return (
+      <div class="candidate-editor">
+        <div class="candidate-head">
+          <span class="eyebrow">候选修改 · {fieldLabel(annotation.field)}</span>
+          {annotation.applied && <ion-badge color="success">已写入修订版</ion-badge>}
+          {round.status === 'completed' && annotation.decision === 'accepted' && !annotation.applied && (
+            <ion-badge color="warning">未写入（基准版本中对象缺失）</ion-badge>
+          )}
+        </div>
+        {annotation.field ? (
+          options ? (
+            <ion-select
+              disabled={disabled}
+              class="studio-input"
+              value={annotation.candidateValue ?? ''}
+              onIonChange={(event) => this.editCandidate(round.id, annotation.id, String(event.detail.value ?? ''))}
+            >
+              {options.map((option) => <ion-select-option value={option}>{option}</ion-select-option>)}
+            </ion-select>
+          ) : (
+            <ion-textarea
+              disabled={disabled}
+              autoGrow
+              class="studio-input"
+              value={annotation.candidateValue ?? ''}
+              onIonInput={(event) => this.editCandidate(round.id, annotation.id, event.detail.value ?? '')}
+            />
+          )
+        ) : (
+          <p class="comment-only-note">纯意见批注，采纳后仅记录处理结论，不产生字段修改。</p>
+        )}
+      </div>
+    );
+  }
+
+  private renderAnnotationCard(round: ReviewRound, annotation: ReviewAnnotation) {
+    const view = this.annotationView(annotation);
+    const location = annotation.targetType === 'module'
+      ? (view?.module?.title ?? annotation.targetHint ?? annotation.targetId)
+      : `${view?.module?.title ?? annotation.moduleId ?? '未定位模块'} · 第${view?.stepOrdinal ?? annotation.stepOrdinal ?? '?'}步 ${view?.step?.title ?? annotation.targetHint ?? annotation.targetId}`;
+    const readOnly = round.status === 'completed';
+    const blocking = annotation.decision === 'accepted' && annotation.conflicts.length > 0 && !annotation.conflictAcknowledged;
+    return (
+      <article class={`annotation-card decision-${annotation.decision} ${annotation.conflicts.length ? 'has-conflict' : ''}`} key={annotation.id}>
+        <header class="annotation-head">
+          <span class="annotation-ordinal">#{annotation.ordinal}</span>
+          <button class="annotation-target" onClick={() => this.locateAnnotation(annotation)} title="在编辑器中定位来源">
+            <span class="target-type">{annotation.targetType === 'module' ? '模块' : '步骤'}</span>
+            <strong>{location}</strong>
+            <span class="locate-mark">定位 →</span>
+          </button>
+          {annotation.field && <ion-badge class="field-badge">{fieldLabel(annotation.field)}</ion-badge>}
+          {annotation.basedOnLabel && <ion-badge color="light" class="version-badge">基于 {annotation.basedOnLabel}</ion-badge>}
+        </header>
+
+        {annotation.originalValue !== undefined && (
+          <div class="annotation-original"><span>批注原值</span><del>{annotation.originalValue}</del></div>
+        )}
+        {annotation.comment && <p class="annotation-comment">{annotation.comment}</p>}
+        {this.renderConflictList(annotation)}
+        {(annotation.decision === 'accepted' || (readOnly && annotation.applied)) && this.renderCandidateEditor(round, annotation)}
+
+        {!readOnly && (
+          <footer class="annotation-actions">
+            <button
+              class={`decision-button accept ${annotation.decision === 'accepted' ? 'on' : ''}`}
+              onClick={() => this.setDecision(round.id, annotation.id, annotation.decision === 'accepted' ? 'pending' : 'accepted')}
+            >
+              {annotation.decision === 'accepted' ? '✓ 已采纳' : '采纳（形成候选）'}
+            </button>
+            <button
+              class={`decision-button keep ${annotation.decision === 'kept' ? 'on' : ''}`}
+              onClick={() => this.setDecision(round.id, annotation.id, annotation.decision === 'kept' ? 'pending' : 'kept')}
+            >
+              {annotation.decision === 'kept' ? '— 已保留' : '保留意见'}
+            </button>
+            {blocking && (
+              <button class="conflict-ack" onClick={() => this.acknowledgeConflict(round.id, annotation.id)}>
+                已核实冲突，仍要采纳
+              </button>
+            )}
+          </footer>
+        )}
+        {readOnly && (
+          <footer class="annotation-actions read-only">
+            <span class={`decision-readout ${annotation.decision}`}>
+              {annotation.decision === 'accepted' ? `✓ 已采纳${annotation.applied && annotation.field ? '并写入' : ''}` : '— 保留意见'}
+            </span>
+            <span class="decided-time">{annotation.decidedAt ? `处理于 ${this.formatDate(annotation.decidedAt)}` : ''}</span>
+          </footer>
+        )}
+      </article>
+    );
+  }
+
+  private renderOpenRound(round: ReviewRound) {
+    const stats = roundStats(round);
+    const baseMissing = !this.project.frozenVersions.some((version) => version.id === round.baseVersionId);
+    const blockingReason = this.roundBlockingReason(round);
+    return (
+      <section class="round-open">
+        <div class="round-head">
+          <div>
+            <span class="eyebrow">进行中的审阅回合</span>
+            <h2>{round.title}</h2>
+            <p>
+              创建于 {this.formatDate(round.createdAt)} · 基准：{this.versionLabel(round.baseVersionId)}
+              {baseMissing && <span class="base-missing">（基准冻结版本已缺失）</span>}
+            </p>
+          </div>
+          <div class="round-stats">
+            <div><strong>{stats.total}</strong><span>意见</span></div>
+            <div class="stat-accepted"><strong>{stats.accepted}</strong><span>采纳</span></div>
+            <div class="stat-kept"><strong>{stats.kept}</strong><span>保留</span></div>
+            <div class={stats.pending ? 'stat-pending' : ''}><strong>{stats.pending}</strong><span>待处理</span></div>
+            <div class={stats.blockingConflicts ? 'stat-conflict' : ''}><strong>{stats.blockingConflicts}</strong><span>冲突未核实</span></div>
+          </div>
+        </div>
+
+        <div class="import-card">
+          <div class="import-head">
+            <h3>粘贴离线批注</h3>
+            <div class="import-tools">
+              <button class="text-button" onClick={() => { this.importText = SAMPLE_ANNOTATIONS; }}>填入示例批注</button>
+              <button class="text-button" onClick={() => { this.importText = ''; }}>清空</button>
+            </div>
+          </div>
+          <p class="import-hint">
+            格式：用“模块 模块名”“步骤 序号 步骤标题 @所属模块”标明对象；每行一条“字段：建议值 ｜ 意见 ｜ 批注原值”；
+            首行可用“@版本：冻结版本 v1”标明批注依据；没有字段的行视为纯意见。同一意见重复导入会自动跳过。
+          </p>
+          <ion-textarea
+            autoGrow
+            class="studio-input import-textarea"
+            placeholder={'模块 模块一 · 日常问候\n模块标题：日常问候与礼仪 ｜ 教研组建议覆盖道别内容\n步骤 2 拆解“你好”的手形 @模块一 · 日常问候\n字幕位置：下方安全区 ｜ 中央字幕挡住手部拆解 ｜ 画面中央'}
+            value={this.importText}
+            onIonInput={(event) => { this.importText = event.detail.value ?? ''; }}
+          />
+          <div class="import-actions">
+            <ion-button class="studio-button" onClick={() => this.importAnnotations()}>导入并核对冲突</ion-button>
+            <button class="text-button danger" onClick={() => this.discardRound(round.id)}>放弃本回合</button>
+          </div>
+        </div>
+
+        <div class="annotation-list">
+          {round.annotations.length === 0 && (
+            <div class="round-empty">还没有批注。把教研组离线批注贴到上方输入框，导入后逐条采纳或保留。</div>
+          )}
+          {round.annotations.map((annotation) => this.renderAnnotationCard(round, annotation))}
+        </div>
+
+        <div class="round-footer">
+          <p>{blockingReason ?? `冲突已全部核实，可以基于“${this.versionLabel(round.baseVersionId)}”生成新修订版。`}</p>
+          <ion-button class="studio-button" color="primary" disabled={Boolean(blockingReason)} onClick={() => this.confirmRound(round.id)}>
+            确认并生成修订版
+          </ion-button>
+        </div>
+      </section>
+    );
+  }
+
+  private renderCompletedRounds() {
+    const completed = this.rounds.filter((round) => round.status === 'completed');
+    if (!completed.length) return null;
+    return (
+      <section class="round-history">
+        <h3>已完成回合（旧版与处理记录保留）</h3>
+        {completed.map((round) => {
+          const stats = roundStats(round);
+          return (
+            <details class="completed-round" key={round.id}>
+              <summary>
+                <strong>{round.title}</strong>
+                <span>{round.resultLabel} · 采纳 {stats.accepted} / 保留 {stats.kept}</span>
+                <small>{round.completedAt ? this.formatDate(round.completedAt) : ''} 完成</small>
+              </summary>
+              <div class="annotation-list compact">
+                {round.annotations.map((annotation) => this.renderAnnotationCard(round, annotation))}
+              </div>
+            </details>
+          );
+        })}
+      </section>
+    );
+  }
+
+  private renderReviewPanel() {
+    const open = this.openRound;
+    return (
+      <section class="review-panel">
+        {!open && (
+          <div class="round-setup card-block">
+            <span class="eyebrow">审阅回合</span>
+            <h2>基于冻结版本处理教研组批注</h2>
+            <p>冻结内容保持只读；采纳的意见先生成候选修改，确认后才会从所选冻结版本复制出新修订版。</p>
+            {this.project.frozenVersions.length === 0 ? (
+              <div class="round-empty">当前还没有冻结版本。请先提交复核并冻结一个版本，教研组的离线批注再以该版本为基准。</div>
+            ) : (
+              <div class="round-setup-row">
+                <ion-select
+                  label="基准冻结版本"
+                  labelPlacement="stacked"
+                  class="studio-input"
+                  value={this.newRoundVersionId}
+                  onIonChange={(event) => { this.newRoundVersionId = String(event.detail.value ?? ''); }}
+                >
+                  {this.project.frozenVersions.map((version) => (
+                    <ion-select-option value={version.id}>{version.label} · {this.formatDate(version.createdAt)}</ion-select-option>
+                  ))}
+                </ion-select>
+                <ion-button class="studio-button" onClick={() => this.createRound()}>开启审阅回合</ion-button>
+              </div>
+            )}
+          </div>
+        )}
+        {open && this.renderOpenRound(open)}
+        {this.renderCompletedRounds()}
+      </section>
+    );
+  }
+
   private renderChecks() {
     const errors = this.checks.filter((check) => check.severity === 'error');
     const warnings = this.checks.filter((check) => check.severity === 'warning');
@@ -609,14 +1162,33 @@ export class AppRoot {
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
                   <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                  <button class={this.activePanel === 'review' ? 'active' : ''} onClick={() => { this.activePanel = 'review'; }}>
+                    审阅回合
+                    {this.openRound && <span class="review-badge">{roundStats(this.openRound).pending || roundStats(this.openRound).total}</span>}
+                  </button>
                 </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                <div class="editor-scroll">
+                  {this.activePanel === 'editor'
+                    ? this.renderStepEditor()
+                    : this.activePanel === 'checks'
+                      ? this.renderChecks()
+                      : this.renderReviewPanel()}
+                </div>
               </section>
 
               {this.renderPreview()}
             </main>
           </ion-content>
           <ion-toast isOpen={Boolean(this.toast)} message={this.toast?.message} color={this.toast?.color} duration={3200} onDidDismiss={() => { this.toast = undefined; }} />
+          <ion-alert
+            isOpen={Boolean(this.alertState)}
+            header={this.alertState?.title}
+            message={this.alertState?.message}
+            buttons={[
+              { text: '取消', role: 'cancel', handler: () => { this.alertState = undefined; } },
+              { text: this.alertState?.confirmText ?? '确认', handler: () => this.alertState?.onConfirm() },
+            ]}
+          />
         </ion-app>
       </Host>
     );

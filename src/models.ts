@@ -37,7 +37,85 @@ export interface FrozenVersion {
   id: string;
   label: string;
   createdAt: string;
-  snapshot: Omit<CourseProject, 'frozenVersions'>;
+  snapshot: ProjectSnapshot;
+}
+
+/** 冻结快照与正式课程结构一致，但不含冻结版本列表本身 */
+export type ProjectSnapshot = Omit<CourseProject, 'frozenVersions'>;
+
+export type ReviewTargetType = 'module' | 'step';
+export type ReviewDecision = 'pending' | 'accepted' | 'kept';
+export type AnnotationConflictType =
+  | 'target-missing' // 批注指向的模块或原步骤在基准冻结版本中不存在
+  | 'step-moved' // 步骤仍在，但序号或所属模块与批注时不一致
+  | 'version-stale' // 批注明确基于更旧的冻结版本
+  | 'value-drift' // 批注记录的原值与基准冻结版本现值不一致
+  | 'invalid-value'; // 建议值无法写入目标字段（枚举非法、数字非法等）
+
+export type ReviewFieldType =
+  | 'module.title'
+  | 'module.summary'
+  | 'module.color'
+  | 'step.title'
+  | 'step.kind'
+  | 'step.duration'
+  | 'step.difficulty'
+  | 'step.demoTitle'
+  | 'step.demoUrl'
+  | 'step.handshape'
+  | 'step.gestureZone'
+  | 'step.caption'
+  | 'step.captionPosition'
+  | 'step.camera'
+  | 'step.commonMistakes'
+  | 'step.exercise'
+  | 'step.exerciseFeedback'
+  | 'step.altText'
+  | 'step.prerequisiteId';
+
+export interface AnnotationConflict {
+  type: AnnotationConflictType;
+  message: string;
+}
+
+export interface ReviewAnnotation {
+  id: string;
+  ordinal: number;
+  targetType: ReviewTargetType;
+  targetId: string;
+  moduleId?: string;
+  /** 批注时步骤在模块内的序号（1 起），用于识别步骤被移动 */
+  stepOrdinal?: number;
+  targetHint?: string;
+  /** 批注所依据的冻结版本标签，与基准版本不同即旧版本冲突 */
+  basedOnLabel?: string;
+  field?: ReviewFieldType;
+  suggestedValue?: string;
+  originalValue?: string;
+  comment: string;
+  /** 采纳后形成的候选值；确认前可编辑，不触碰冻结内容 */
+  candidateValue?: string;
+  decision: ReviewDecision;
+  conflicts: AnnotationConflict[];
+  fingerprint: string;
+  importedAt: string;
+  decidedAt?: string;
+  /** 采纳项带冲突时，教师核实后显式放行 */
+  conflictAcknowledged?: boolean;
+  /** 确认生成修订版后，候选修改是否已写入 */
+  applied?: boolean;
+}
+
+export interface ReviewRound {
+  id: string;
+  title: string;
+  createdAt: string;
+  baseVersionId: string;
+  annotations: ReviewAnnotation[];
+  status: 'open' | 'completed';
+  completedAt?: string;
+  resultLabel?: string;
+  resultRevision?: number;
 }
 
 export interface CourseProject {
