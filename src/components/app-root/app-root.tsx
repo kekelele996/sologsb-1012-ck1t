@@ -1,18 +1,30 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
   cloneProject,
+  confirmReviewRound,
   createDemoProject,
+  createReviewRound,
+  importReviewComments,
+  MODULE_FIELDS,
+  retargetComment,
+  roundBaseSnapshot,
+  roundProgress,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
+  STEP_FIELDS,
   validateProject,
   type CameraAngle,
   type CaptionPosition,
+  type CommentTargetType,
   type CourseModule,
   type CourseProject,
   type Difficulty,
+  type FieldSpec,
   type GestureZone,
   type LessonStep,
+  type ReviewComment,
+  type ReviewRound,
   type ValidationCheck,
 } from '../../models';
 
@@ -26,7 +38,11 @@ type PreviewSize = 'phone' | 'tablet';
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
-  @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() activePanel: 'editor' | 'checks' | 'review' = 'editor';
+  @State() activeRoundId?: string;
+  @State() importText = '';
+  @State() importVersionOld = false;
+  @State() importVersionLabel?: string;
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
@@ -308,6 +324,223 @@ export class AppRoot {
     this.commit((draft) => ({ ...draft, status: 'draft' }), '已创建修订版，可继续编辑。');
   }
 
+  // ===== 审阅回合 =====
+  private get activeRound(): ReviewRound | undefined {
+    return this.project.reviewRounds.find((round) => round.id === this.activeRoundId);
+  }
+
+  private get openRoundCount(): number {
+    return this.project.reviewRounds.filter((round) => round.status === 'open').length;
+  }
+
+  private openReviewPanel(): void {
+    this.activePanel = 'review';
+    const open = this.project.reviewRounds.find((round) => round.status === 'open');
+    this.activeRoundId = open?.id;
+    this.importText = '';
+    this.importVersionOld = false;
+    this.importVersionLabel = undefined;
+  }
+
+  private startRound(frozenVersionId: string): void {
+    const round = createReviewRound(this.project, frozenVersionId);
+    this.project = { ...this.project, reviewRounds: [round, ...this.project.reviewRounds] };
+    this.activeRoundId = round.id;
+    this.importText = '';
+    this.importVersionOld = false;
+    this.importVersionLabel = undefined;
+    this.persist();
+  }
+
+  private openRound(roundId: string): void {
+    this.activeRoundId = roundId;
+    this.importText = '';
+    this.importVersionOld = false;
+    this.importVersionLabel = undefined;
+  }
+
+  private deleteRound(roundId: string): void {
+    this.project = { ...this.project, reviewRounds: this.project.reviewRounds.filter((round) => round.id !== roundId) };
+    if (this.activeRoundId === roundId) this.activeRoundId = undefined;
+    this.persist();
+    this.showToast('success', '已删除该审阅回合。');
+  }
+
+  private updateRound(roundId: string, patch: Partial<ReviewRound>): void {
+    this.project = {
+      ...this.project,
+      reviewRounds: this.project.reviewRounds.map((round) => (round.id === roundId ? { ...round, ...patch } : round)),
+    };
+    this.persist();
+  }
+
+  private importComments(): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const text = this.importText.trim();
+    if (!text) {
+      this.showToast('warning', '请先粘贴教研组带回的离线批注。');
+      return;
+    }
+    const base = roundBaseSnapshot(this.project, round);
+    if (!base) {
+      this.showToast('danger', '找不到该回合对应的冻结版本，无法匹配批注。');
+      return;
+    }
+    const baseVersion = Number(round.frozenLabel.match(/(\d+)/)?.[1] ?? round.basedOnRevision);
+    const result = importReviewComments(text, base, this.project, this.project.reviewRounds, baseVersion);
+    if (result.comments.length === 0) {
+      this.showToast('warning', result.duplicateCount
+        ? `导入的 ${result.duplicateCount} 条意见均已处理过，已自动忽略。`
+        : '未识别到可导入的意见，请按「[模块]/[步骤] + - 意见」格式粘贴。');
+      return;
+    }
+    this.updateRound(round.id, { comments: [...round.comments, ...result.comments] });
+    this.importText = '';
+    this.importVersionOld = result.versionOld;
+    this.importVersionLabel = result.versionLabel;
+    const parts = [`已导入 ${result.comments.length} 条意见`];
+    if (result.duplicateCount) parts.push(`忽略 ${result.duplicateCount} 条重复`);
+    if (result.versionOld) parts.push('批注基于旧版本');
+    this.showToast(result.versionOld ? 'warning' : 'success', `${parts.join('，')}。`);
+  }
+
+  private fieldSpecFor(comment: ReviewComment): FieldSpec[] {
+    return comment.targetType === 'module' ? MODULE_FIELDS : STEP_FIELDS;
+  }
+
+  private fieldValueOf(comment: ReviewComment, field: string): string {
+    const base = this.activeRound ? roundBaseSnapshot(this.project, this.activeRound) : null;
+    if (!base) return '';
+    if (comment.targetType === 'module') {
+      const mod = base.modules.find((item) => item.id === comment.moduleId);
+      return mod ? String((mod as unknown as Record<string, unknown>)[field] ?? '') : '';
+    }
+    const mod = base.modules.find((item) => item.id === comment.moduleId);
+    const step = mod?.steps.find((item) => item.id === comment.stepId);
+    if (!step) return '';
+    if (field === 'commonMistakes') return step.commonMistakes.join('\n');
+    return String((step as unknown as Record<string, unknown>)[field] ?? '');
+  }
+
+  private fieldLabelOf(comment: ReviewComment, field: string): string {
+    return this.fieldSpecFor(comment).find((item) => item.value === field)?.label ?? field;
+  }
+
+  private moduleTitleOf(comment: ReviewComment): string {
+    const base = this.activeRound ? roundBaseSnapshot(this.project, this.activeRound) : null;
+    return base?.modules.find((item) => item.id === comment.moduleId)?.title ?? '未归属模块';
+  }
+
+  private suggestField(comment: ReviewComment): string {
+    const content = comment.content;
+    if (comment.targetType === 'module') {
+      if (/目标|定位|summary/i.test(content)) return 'summary';
+      if (/颜色|主题色|color/i.test(content)) return 'color';
+      return 'title';
+    }
+    if (/字幕|caption/i.test(content)) return 'caption';
+    if (/手形|手型|掌心|handshape/i.test(content)) return 'handshape';
+    if (/时长|时间|duration|秒/i.test(content)) return 'duration';
+    if (/镜头|机位|camera|角度/i.test(content)) return 'camera';
+    if (/位置|区域|遮挡|zone/i.test(content)) return 'gestureZone';
+    if (/替代文本|alt|无障碍/i.test(content)) return 'altText';
+    if (/错误|mistake/i.test(content)) return 'commonMistakes';
+    if (/练习|exercise/i.test(content)) return /反馈|feedback/i.test(content) ? 'exerciseFeedback' : 'exercise';
+    if (/标题|名称|title/i.test(content)) return 'title';
+    return 'caption';
+  }
+
+  private setCommentDecision(commentId: string, decision: ReviewComment['decision']): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const comments = round.comments.map((comment) => {
+      if (comment.id !== commentId) return comment;
+      if (decision === 'adopt') {
+        const field = this.suggestField(comment);
+        return { ...comment, decision, decidedAt: new Date().toISOString(), candidate: { field, value: this.fieldValueOf(comment, field) } };
+      }
+      return { ...comment, decision, decidedAt: new Date().toISOString(), candidate: decision === 'keep' ? undefined : comment.candidate };
+    });
+    this.updateRound(round.id, { comments });
+  }
+
+  private setCandidateField(commentId: string, field: string): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const comments = round.comments.map((comment) => (
+      comment.id === commentId ? { ...comment, candidate: { field, value: this.fieldValueOf(comment, field) } } : comment
+    ));
+    this.updateRound(round.id, { comments });
+  }
+
+  private setCandidateValue(commentId: string, value: string): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const comments = round.comments.map((comment) => (
+      comment.id === commentId && comment.candidate ? { ...comment, candidate: { ...comment.candidate, value } } : comment
+    ));
+    this.updateRound(round.id, { comments });
+  }
+
+  private skipConflict(commentId: string): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const comments = round.comments.map((comment) => (
+      comment.id === commentId
+        ? { ...comment, decision: 'keep' as const, candidate: undefined, conflictKind: undefined, conflictDetail: undefined, decidedAt: new Date().toISOString() }
+        : comment
+    ));
+    this.updateRound(round.id, { comments });
+  }
+
+  private retarget(commentId: string, targetType: CommentTargetType, moduleId: string, stepId?: string): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const base = roundBaseSnapshot(this.project, round);
+    if (!base) return;
+    let targetTitle = '';
+    if (targetType === 'module') {
+      targetTitle = base.modules.find((item) => item.id === moduleId)?.title ?? '';
+    } else {
+      const mod = base.modules.find((item) => item.id === moduleId);
+      targetTitle = mod?.steps.find((item) => item.id === stepId)?.title ?? '';
+    }
+    const comments = round.comments.map((comment) => (comment.id === commentId ? retargetComment(comment, targetType, moduleId, stepId, targetTitle) : comment));
+    this.updateRound(round.id, { comments });
+  }
+
+  private confirmRound(): void {
+    const round = this.activeRound;
+    if (!round) return;
+    const progress = roundProgress(round);
+    if (progress.blocked > 0) {
+      this.showToast('danger', '仍有冲突未处理，请先重新指定归属或跳过。');
+      return;
+    }
+    if (progress.pending > 0) {
+      this.showToast('warning', '还有意见未逐条选择采纳或保留。');
+      return;
+    }
+    const missingCandidate = round.comments.some((comment) => comment.decision === 'adopt' && !comment.candidate?.value.trim());
+    if (missingCandidate) {
+      this.showToast('warning', '采纳的意见需要填写候选修改内容后再确认。');
+      return;
+    }
+    const before = cloneProject(this.project);
+    const next = confirmReviewRound(this.project, round.id);
+    if (next === this.project) {
+      this.showToast('danger', '生成修订版失败：找不到对应的冻结版本。');
+      return;
+    }
+    this.past = [...this.past, before].slice(-80);
+    this.future = [];
+    this.project = next;
+    this.activeRoundId = undefined;
+    this.persist();
+    this.showToast('success', `已基于「${round.frozenLabel}」生成新修订版（v${next.revision}），旧版本与处理记录已保留。`);
+  }
+
   private togglePlay(): void {
     if (this.playTimer) {
       window.clearInterval(this.playTimer);
@@ -540,6 +773,276 @@ export class AppRoot {
     );
   }
 
+  private renderReview() {
+    const active = this.activeRound;
+    return (
+      <section class="review-panel">
+        {active ? this.renderRoundDetail(active) : this.renderRoundList()}
+      </section>
+    );
+  }
+
+  private renderRoundList() {
+    const frozen = this.project.frozenVersions;
+    const rounds = this.project.reviewRounds;
+    return (
+      <div class="round-list">
+        <div class="round-intro">
+          <span class="eyebrow">离线批注复核</span>
+          <h2>审阅回合</h2>
+          <p>教研组带回的批注按冻结版本导入，逐条选择采纳或保留。采纳只形成候选修改、不覆盖冻结内容；确认后才从所选冻结版本生成新修订版，旧版本与处理记录都会保留，重开也能继续。</p>
+        </div>
+
+        {frozen.length === 0 ? (
+          <div class="round-empty">
+            <strong>还没有可审阅的冻结版本</strong>
+            <p>先在课程处于「待复核」时冻结一个版本，再把教研组针对该版本的批注贴进来。</p>
+          </div>
+        ) : (
+          <div class="round-start">
+            <h3>新建审阅回合 · 选择冻结版本</h3>
+            <div class="frozen-picker">
+              {frozen.map((item) => (
+                <button class="frozen-pick" key={item.id} onClick={() => this.startRound(item.id)}>
+                  <strong>{item.label}</strong>
+                  <small>{this.formatDate(item.createdAt)} · 修订号 {item.snapshot.revision}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {rounds.length > 0 && (
+          <div class="round-history">
+            <h3>历史回合</h3>
+            {rounds.map((round) => {
+              const progress = roundProgress(round);
+              return (
+                <button class="round-card" key={round.id} onClick={() => this.openRound(round.id)}>
+                  <div class="round-card-main">
+                    <strong>{round.frozenLabel} 审阅回合</strong>
+                    <small>{this.formatDate(round.createdAt)} · {round.comments.length} 条意见</small>
+                  </div>
+                  <div class="round-card-side">
+                    {round.status === 'confirmed'
+                      ? <span class="round-tag confirmed">已生成修订版 v{round.resultRevision}</span>
+                      : <span class="round-tag open">进行中 · {progress.decided}/{progress.total}</span>}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  private renderRoundDetail(round: ReviewRound) {
+    const progress = roundProgress(round);
+    const confirmed = round.status === 'confirmed';
+    const conflicts = round.comments.filter((comment) => comment.conflictKind === 'missing' || comment.conflictKind === 'moved');
+    const ready = progress.blocked === 0 && progress.pending === 0
+      && !round.comments.some((comment) => comment.decision === 'adopt' && !comment.candidate?.value.trim());
+
+    return (
+      <div class="round-detail">
+        <div class="round-detail-head">
+          <button class="back-button" onClick={() => { this.activeRoundId = undefined; }}>← 全部回合</button>
+          <div class="round-detail-title">
+            <h2>{round.frozenLabel} 审阅回合</h2>
+            <p>基于修订号 {round.basedOnRevision} · {this.formatDate(round.createdAt)}</p>
+          </div>
+          {!confirmed && <button class="round-delete" onClick={() => this.deleteRound(round.id)}>删除回合</button>}
+        </div>
+
+        <div class="round-progress">
+          <div><strong>{progress.total}</strong><span>意见总数</span></div>
+          <div><strong>{progress.adopted}</strong><span>采纳</span></div>
+          <div><strong>{progress.kept}</strong><span>保留</span></div>
+          <div><strong>{progress.pending}</strong><span>待处理</span></div>
+        </div>
+
+        {!confirmed && (
+          <div class="round-import">
+            <h3>导入离线批注</h3>
+            <p class="import-hint">
+              粘贴教研组批注：用 <code>[模块] 标题</code> 或 <code>[步骤] 标题</code> 分组，意见以 <code>-</code> 开头；可在首行标注 <code>版本：v1</code> 表示批注基于的版本。同一意见重复导入只处理一次。
+            </p>
+            <textarea
+              class="import-textarea"
+              placeholder={'[模块] 模块一 · 日常问候\n- 建议在模块目标中补充与日常生活场景的联系\n\n[步骤] 观察“你好”的完整动作\n- 字幕与动作区域重叠，建议下移到安全区\n- 手形说明可补充掌心方向\n\n[步骤] 拆解“你好”的手形\n- 前置标注正确，保留即可'}
+              value={this.importText}
+              onInput={(event) => { this.importText = (event.target as HTMLTextAreaElement).value; }}
+            />
+            <div class="import-actions">
+              <ion-button class="studio-button" onClick={() => this.importComments()}>导入批注</ion-button>
+              <button class="link-button" onClick={() => { this.importText = ''; }}>清空</button>
+            </div>
+            {this.importVersionOld && (
+              <div class="version-old-banner">这批批注基于旧版本（{this.importVersionLabel}），将按所选「{round.frozenLabel}」应用，请注意核对每条意见的归属。</div>
+            )}
+          </div>
+        )}
+
+        {conflicts.length > 0 && !confirmed && (
+          <div class="conflict-summary">
+            <strong>检测到 {conflicts.length} 个冲突</strong>
+            <span>步骤被移动、原步骤不存在或批注基于旧版本时，请先在下方逐条重新指定归属或跳过，再决定采纳或保留。</span>
+          </div>
+        )}
+
+        <div class="comment-list">
+          {round.comments.length === 0 && (
+            <div class="round-empty"><strong>还没有导入意见</strong><p>在上方粘贴教研组批注并导入，意见会按模块和步骤归类。</p></div>
+          )}
+          {round.comments.map((comment) => this.renderCommentCard(comment, confirmed))}
+        </div>
+
+        {!confirmed ? (
+          <div class="round-confirm">
+            <div class="confirm-readiness">
+              {progress.blocked > 0 && <span class="warn">还有 {progress.blocked} 个冲突未处理</span>}
+              {progress.blocked === 0 && progress.pending > 0 && <span class="warn">还有 {progress.pending} 条意见未决定</span>}
+              {progress.blocked === 0 && progress.pending === 0 && round.comments.some((comment) => comment.decision === 'adopt' && !comment.candidate?.value.trim()) && <span class="warn">采纳的意见需填写候选修改</span>}
+              {ready && <span class="ok">所有意见已处理，可基于「{round.frozenLabel}」生成新修订版</span>}
+            </div>
+            <ion-button color="success" class="studio-button" disabled={!ready} onClick={() => this.confirmRound()}>确认并生成新修订版</ion-button>
+          </div>
+        ) : (
+          <div class="round-confirmed-banner">已基于「{round.frozenLabel}」生成新修订版 v{round.resultRevision}，旧版本与本回合处理记录均已保留，可返回步骤编排继续编辑。</div>
+        )}
+      </div>
+    );
+  }
+
+  private renderCommentCard(comment: ReviewComment, confirmed: boolean) {
+    const isModule = comment.targetType === 'module';
+    const targetLabel = isModule ? comment.targetTitle : `${this.moduleTitleOf(comment)} · ${comment.targetTitle}`;
+    const adopted = comment.decision === 'adopt';
+    const kept = comment.decision === 'keep';
+    const conflict = comment.conflictKind;
+
+    return (
+      <div class={`comment-card ${comment.decision !== 'pending' ? `decided ${comment.decision}` : ''} ${conflict ? 'has-conflict' : ''}`} key={comment.id}>
+        <div class="comment-target">
+          <span class={`target-badge ${isModule ? 'module' : 'step'}`}>{isModule ? '模块' : '步骤'}</span>
+          <strong>{targetLabel}</strong>
+          {comment.retargeted && <span class="retargeted-tag">已重新指定</span>}
+        </div>
+        <p class="comment-content">{comment.content}</p>
+
+        {conflict && !confirmed && (
+          <div class="conflict-box">
+            <strong>{conflict === 'missing' ? '原目标不存在' : '目标已被移动'}</strong>
+            <span>{comment.conflictDetail}</span>
+            <div class="conflict-actions">
+              {isModule ? this.renderModuleRetarget(comment) : this.renderStepRetarget(comment)}
+              <button class="link-button danger" onClick={() => this.skipConflict(comment.id)}>跳过（保留原文）</button>
+            </div>
+          </div>
+        )}
+
+        {!confirmed && !conflict && (
+          <div class="comment-decision">
+            <button class={adopted ? 'active adopt' : ''} onClick={() => this.setCommentDecision(comment.id, 'adopt')}>采纳并修改</button>
+            <button class={kept ? 'active keep' : ''} onClick={() => this.setCommentDecision(comment.id, 'keep')}>保留原文</button>
+          </div>
+        )}
+
+        {adopted && comment.candidate && !confirmed && !conflict && (
+          <div class="candidate-editor">
+            <div class="candidate-field">
+              <label>修改字段</label>
+              <ion-select class="studio-input" value={comment.candidate.field} onIonChange={(event) => this.setCandidateField(comment.id, event.detail.value as string)}>
+                {this.fieldSpecFor(comment).map((field) => <ion-select-option value={field.value}>{field.label}</ion-select-option>)}
+              </ion-select>
+            </div>
+            <div class="candidate-value">
+              <label>候选新值（不覆盖冻结内容，确认后才写入新修订版）</label>
+              {this.renderCandidateInput(comment)}
+            </div>
+            <div class="candidate-diff"><span>原值：{this.fieldValueOf(comment, comment.candidate.field) || '（空）'}</span></div>
+          </div>
+        )}
+
+        {confirmed && adopted && comment.candidate && (
+          <div class="candidate-readonly">已采纳 · {this.fieldLabelOf(comment, comment.candidate.field)}：{comment.candidate.value}</div>
+        )}
+        {confirmed && kept && <div class="kept-note">已保留原文，未做修改。</div>}
+      </div>
+    );
+  }
+
+  private renderCandidateInput(comment: ReviewComment) {
+    const candidate = comment.candidate;
+    if (!candidate) return null;
+    const spec = this.fieldSpecFor(comment).find((item) => item.value === candidate.field);
+    if (!spec) return null;
+    if (spec.type === 'textarea') {
+      return <ion-textarea autoGrow class="studio-input" value={candidate.value} onIonInput={(event) => this.setCandidateValue(comment.id, event.detail.value ?? '')} />;
+    }
+    if (spec.type === 'number') {
+      return <ion-input type="number" class="studio-input" value={candidate.value} onIonInput={(event) => this.setCandidateValue(comment.id, event.detail.value ?? '')} />;
+    }
+    if (spec.type === 'select' && spec.options) {
+      return (
+        <ion-select class="studio-input" value={candidate.value} onIonChange={(event) => this.setCandidateValue(comment.id, event.detail.value as string)}>
+          {spec.options.map((option) => <ion-select-option value={option}>{option}</ion-select-option>)}
+        </ion-select>
+      );
+    }
+    return <ion-input class="studio-input" value={candidate.value} onIonInput={(event) => this.setCandidateValue(comment.id, event.detail.value ?? '')} />;
+  }
+
+  private renderModuleRetarget(comment: ReviewComment) {
+    const base = this.activeRound ? roundBaseSnapshot(this.project, this.activeRound) : null;
+    if (!base) return null;
+    return (
+      <div class="retarget-row">
+        <ion-select
+          class="studio-input retarget-select"
+          value={comment.moduleId}
+          placeholder="重新指定模块…"
+          onIonChange={(event) => this.retarget(comment.id, 'module', event.detail.value as string)}
+        >
+          {base.modules.map((mod) => <ion-select-option value={mod.id}>{mod.title}</ion-select-option>)}
+        </ion-select>
+      </div>
+    );
+  }
+
+  private renderStepRetarget(comment: ReviewComment) {
+    const base = this.activeRound ? roundBaseSnapshot(this.project, this.activeRound) : null;
+    if (!base) return null;
+    const currentModule = base.modules.find((mod) => mod.id === comment.moduleId);
+    const steps = currentModule?.steps ?? [];
+    return (
+      <div class="retarget-row">
+        <ion-select
+          class="studio-input retarget-select"
+          value={comment.moduleId}
+          placeholder="选择模块…"
+          onIonChange={(event) => {
+            const newModuleId = event.detail.value as string;
+            const newModule = base.modules.find((mod) => mod.id === newModuleId);
+            const keepStep = newModule?.steps.some((step) => step.id === comment.stepId) ? comment.stepId : undefined;
+            this.retarget(comment.id, 'step', newModuleId, keepStep);
+          }}
+        >
+          {base.modules.map((mod) => <ion-select-option value={mod.id}>{mod.title}</ion-select-option>)}
+        </ion-select>
+        <ion-select
+          class="studio-input retarget-select"
+          value={comment.stepId ?? ''}
+          placeholder="选择步骤…"
+          onIonChange={(event) => this.retarget(comment.id, 'step', comment.moduleId, event.detail.value as string)}
+        >
+          {steps.map((step) => <ion-select-option value={step.id}>{step.title}</ion-select-option>)}
+        </ion-select>
+      </div>
+    );
+  }
+
   render() {
     const module = this.currentModule;
     const errors = this.checks.filter((check) => check.severity === 'error').length;
@@ -609,8 +1112,11 @@ export class AppRoot {
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
                   <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                  <button class={this.activePanel === 'review' ? 'active' : ''} onClick={() => this.openReviewPanel()}>审阅回合 {this.openRoundCount > 0 && <span>{this.openRoundCount}</span>}</button>
                 </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                <div class="editor-scroll">
+                  {this.activePanel === 'editor' ? this.renderStepEditor() : this.activePanel === 'checks' ? this.renderChecks() : this.renderReview()}
+                </div>
               </section>
 
               {this.renderPreview()}
